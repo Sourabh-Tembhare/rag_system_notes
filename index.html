@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RAG System in Node.js – Practical Notes | Sourabh Tembhare</title>
+<style>
+:root{--bg:#000;--panel:#141414;--line:#262626;--text:#e8e8e8;--mute:#8d8d8d;--accent:#7cc4ff;--ok:#6fdc8c}
+*{box-sizing:border-box}
+html{scroll-behavior:smooth;scroll-padding-top:70px}
+body{margin:0;background:var(--bg);color:var(--text);font:16px/1.7 "Segoe UI",system-ui,sans-serif}
+nav{position:sticky;top:0;z-index:5;background:#000d;backdrop-filter:blur(8px);border-bottom:1px solid var(--line);display:flex;gap:6px;padding:10px 16px;overflow-x:auto}
+nav a{color:var(--mute);text-decoration:none;padding:6px 12px;border-radius:6px;white-space:nowrap;font-size:14px}
+nav a:hover{color:#fff;background:var(--panel)}
+main{max-width:860px;margin:0 auto;padding:40px 20px 80px}
+h1{font-size:2.3rem;line-height:1.2;margin:.2em 0}
+h2{font-size:1.7rem;margin:72px 0 6px;padding-top:24px;border-top:1px solid var(--line)}
+h3{font-size:1.1rem;margin:36px 0 6px;color:#fff}
+p{margin:6px 0 12px;color:#c4c4c4}
+.by{color:var(--mute);font-size:15px}
+.by b{color:var(--accent)}
+.note{border-left:3px solid var(--accent);background:var(--panel);padding:10px 14px;border-radius:0 8px 8px 0;color:#c4c4c4;margin:14px 0}
+.warn{border-left-color:#ffb454}
+.code{position:relative;background:var(--panel);border:1px solid var(--line);border-radius:10px;margin:10px 0 18px}
+.code .file{padding:7px 14px;font:12px Consolas,monospace;color:var(--mute);border-bottom:1px solid var(--line)}
+pre{margin:0;padding:14px;overflow-x:auto;font:14px/1.6 Consolas,"Courier New",monospace;color:#e8e8e8}
+button.copy{position:absolute;top:5px;right:8px;background:#222;color:var(--text);border:1px solid #333;border-radius:6px;padding:3px 11px;font-size:12px;cursor:pointer}
+button.copy:hover{background:#2f2f2f}
+button.copy.done{color:var(--ok);border-color:var(--ok)}
+button.copy:focus-visible,nav a:focus-visible{outline:2px solid var(--accent)}
+code.i{background:var(--panel);padding:1px 6px;border-radius:4px;font:14px Consolas,monospace}
+footer{border-top:1px solid var(--line);padding:26px 20px;text-align:center;color:var(--mute);font-size:14px}
+</style>
+</head>
+<body>
+<nav>
+<a href="#setup">Setup</a><a href="#phase1">Phase 1: Create Index</a><a href="#phase2">Phase 2: Store Vectors</a><a href="#phase3">Phase 3: Query &amp; Answer</a><a href="#run">Run Order</a>
+</nav>
+<main>
+<p class="by">Created by <b>Sourabh Tembhare</b>, owner of the Sourabh Tembhare YouTube channel</p>
+<h1>Build a RAG System in Node.js</h1>
+<p>Practical coding notes. Chat with your own PDF using Gemini, LangChain and Pinecone. Copy each step, paste it in order, and run.</p>
+<div class="note">Stack: Node.js, Gemini (embeddings + chat), Pinecone (vector DB), LangChain (PDF loader, splitter). Put your PDF in the project folder, for example <code class="i">nodejs_backend_notes.pdf</code>.</div>
+
+<h2 id="setup">Project Setup</h2>
+<h3>Step 1: Create the project</h3>
+<p>Make a folder, open it in the terminal, and initialise it. The last command turns on ES module <code class="i">import</code> syntax.</p>
+<pre>mkdir rag-system
+cd rag-system
+npm init -y
+npm pkg set type=module</pre>
+
+<h3>Step 2: Install all packages</h3>
+<pre>npm i @google/genai @langchain/community @langchain/core @langchain/google-genai @langchain/pinecone @langchain/textsplitters @pinecone-database/pinecone dotenv pdf-parse readline-sync</pre>
+
+<h3>Step 3: Get your API keys</h3>
+<p>Create a Gemini key in Google AI Studio and a Pinecone key in the Pinecone dashboard. Save both in a file named <code class="i">.env</code>.</p>
+<div class="note warn">Never share your real keys or upload <code class="i">.env</code> to GitHub. Add <code class="i">.env</code> to <code class="i">.gitignore</code>.</div>
+<pre>GEMINI_API_KEY=your_gemini_api_key_here
+PINECONE_API_KEY=your_pinecone_api_key_here
+PINECONE_ENVIRONMENT=us-east-1
+PINECONE_INDEX_NAME=rag-pdf-index</pre>
+
+<h2 id="phase1">Phase 1: Create the Pinecone Index</h2>
+<p>File: <code class="i">createIndex.js</code>. Run this only once. The index is the "database table" that will hold your vectors.</p>
+
+<h3>Step 1: Import and connect to Pinecone</h3>
+<pre>import 'dotenv/config';
+import { Pinecone } from '@pinecone-database/pinecone';
+
+const pc = new Pinecone({
+  apiKey: process.env.PINECONE_API_KEY,
+});</pre>
+
+<h3>Step 2: Check if the index already exists</h3>
+<p>This stops the script from creating the same index twice.</p>
+<pre>async function createRagIndex() {
+  const indexName = process.env.PINECONE_INDEX_NAME;
+
+  const existingIndexes = await pc.listIndexes();
+  const alreadyExists = existingIndexes.indexes?.some(
+    (idx) =&gt; idx.name === indexName
+  );
+
+  if (alreadyExists) {
+    console.log(`Index "${indexName}" already exists.`);
+    return;
+  }</pre>
+
+<h3>Step 3: Create the index</h3>
+<p><code class="i">dimension: 3072</code> must match the Gemini embedding size. <code class="i">cosine</code> measures how similar two vectors are.</p>
+<pre>  await pc.createIndex({
+    name: indexName,
+    dimension: 3072,
+    metric: 'cosine',
+    spec: {
+      serverless: {
+        cloud: 'aws',
+        region: 'us-east-1',
+      },
+    },
+    waitUntilReady: true,
+  });
+
+  console.log(`Index "${indexName}" is ready!`);
+}</pre>
+
+<h3>Step 4: Run the function with error handling</h3>
+<pre>createRagIndex().catch((error) =&gt; {
+  console.error('Index creation failed:', error.message);
+  process.exitCode = 1;
+});</pre>
+<p>Run it with <code class="i">node createIndex.js</code></p>
+
+<h2 id="phase2">Phase 2: Store Vectors into the Vector DB</h2>
+<p>File: <code class="i">storeVectors.js</code>. Flow: PDF → pages → chunks → embeddings → Pinecone.</p>
+
+<h3>Step 1: Load the environment and imports</h3>
+<pre>import * as dotenv from 'dotenv';
+dotenv.config();
+import { Pinecone } from '@pinecone-database/pinecone';
+import { PDFLoader } from '@langchain/community/document_loaders/fs/pdf';
+import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
+import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
+import { PineconeStore } from '@langchain/pinecone';
+
+async function storePdfVectors() {</pre>
+
+<h3>Step 2: Load the PDF file</h3>
+<p>The loader reads the PDF and returns one document per page.</p>
+<pre>  const PDF_FILE_PATH = './nodejs_backend_notes.pdf';
+  const pdfLoader = new PDFLoader(PDF_FILE_PATH);
+  const pdfDocs = await pdfLoader.load();</pre>
+<p>Optional: check that the PDF loaded.</p>
+<pre>  console.log(pdfDocs.length);</pre>
+
+<h3>Step 3: Split the PDF into chunks</h3>
+<p>Each chunk is up to 1000 characters. 200 characters overlap between chunks so no sentence loses its meaning.</p>
+<pre>  const splitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 1000,
+    chunkOverlap: 200,
+  });
+
+  const chunks = await splitter.splitDocuments(pdfDocs);</pre>
+
+<h3>Step 4: Set up the embedding model</h3>
+<p>The embedding model turns text into numbers (vectors) that capture meaning.</p>
+<pre>  const embeddings = new GoogleGenerativeAIEmbeddings({
+    apiKey: process.env.GEMINI_API_KEY,
+    model: 'gemini-embedding-2',
+  });</pre>
+
+<h3>Step 5: Connect to your Pinecone index</h3>
+<pre>  const pinecone = new Pinecone();
+  const index = pinecone.Index(process.env.PINECONE_INDEX_NAME);</pre>
+
+<h3>Step 6: Embed the chunks and store them</h3>
+<p>This one call creates a vector for every chunk and uploads it to Pinecone with its text.</p>
+<pre>  await PineconeStore.fromDocuments(chunks, embeddings, {
+    pineconeIndex: index,
+    maxConcurrency: 5,
+  });
+
+  console.log('All chunks stored in Pinecone!');
+}
+
+storePdfVectors();</pre>
+<p>Run it with <code class="i">node storeVectors.js</code></p>
+
+<h2 id="phase3">Phase 3: Query Resolving (Ask Questions)</h2>
+<p>File: <code class="i">chat.js</code>. Flow: user question → rewrite → embed → search Pinecone → send context to Gemini → answer.</p>
+
+<h3>Step 1: Imports and Gemini client</h3>
+<pre>import * as dotenv from 'dotenv';
+dotenv.config();
+import readlineSync from 'readline-sync';
+import { GoogleGenerativeAIEmbeddings } from '@langchain/google-genai';
+import { Pinecone } from '@pinecone-database/pinecone';
+import { GoogleGenAI } from '@google/genai';
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });</pre>
+
+<h3>Step 2: Create the chat history</h3>
+<p>This array remembers earlier questions and answers, so follow-up questions work.</p>
+<pre>const chatHistory = [];</pre>
+
+<h3>Step 3: Rewrite the follow-up question</h3>
+<p>A question like "explain more" means nothing alone. This function uses the history to turn it into a full standalone question before searching.</p>
+<pre>async function rewriteQuery(question) {
+  chatHistory.push({
+    role: 'user',
+    parts: [{ text: question }],
+  });
+
+  const response = await ai.models.generateContent({
+    model: 'gemini-3.1-flash-lite',
+    contents: chatHistory,
+    config: {
+      systemInstruction: `
+You are an expert in conversational query reformulation.
+Your job is to analyze the conversation history and identify the actual intent behind the user's latest question.
+Rewrite the latest question so that it is clear, self-contained, and understandable without requiring any previous messages. Use relevant details from earlier conversations whenever necessary to resolve references, missing context, or ambiguity.
+Do not answer the question, provide explanations, or add any extra commentary.
+Return only the rewritten question.
+`,
+    },
+  });
+
+  chatHistory.pop();
+  return response.text;
+}</pre>
+
+<h3>Step 4: Start the main chat function and embed the question</h3>
+<p>Use the same embedding model as Phase 2, otherwise the vectors will not match.</p>
+<pre>async function askQuestion(question) {
+  const standaloneQuestion = await rewriteQuery(question);
+
+  const embeddings = new GoogleGenerativeAIEmbeddings({
+    apiKey: process.env.GEMINI_API_KEY,
+    model: 'gemini-embedding-2',
+  });
+
+  const questionVector = await embeddings.embedQuery(standaloneQuestion);</pre>
+
+<h3>Step 5: Search Pinecone for similar chunks</h3>
+<p><code class="i">topK: 10</code> returns the 10 chunks closest in meaning to the question.</p>
+<pre>  const pinecone = new Pinecone();
+  const index = pinecone.Index(process.env.PINECONE_INDEX_NAME);
+
+  const searchResponse = await index.query({
+    topK: 10,
+    vector: questionVector,
+    includeMetadata: true,
+  });</pre>
+
+<h3>Step 6: Build the context text</h3>
+<p>Join the text of all matched chunks into one string. This is the "Retrieval" part of RAG.</p>
+<pre>  const contextText = searchResponse.matches
+    .map((match) =&gt; match.metadata.text)
+    .join('\n\n---\n\n');</pre>
+
+<h3>Step 7: Save the user question in history</h3>
+<pre>  chatHistory.push({
+    role: 'user',
+    parts: [{ text: question }],
+  });</pre>
+
+<h3>Step 8: Generate the answer with system instructions</h3>
+<p>The system instruction tells Gemini to answer only from the retrieved context. This is the "Generation" part, and it stops made-up answers.</p>
+<pre>  const response = await ai.models.generateContent({
+    model: 'gemini-3.1-flash-lite',
+    contents: chatHistory,
+    config: {
+     systemInstruction: `
+You are a knowledgeable Node.js technical assistant working with a document-based question-answering system.
+
+Answer the user's question by relying exclusively on the information provided in the retrieved context.
+
+Follow these guidelines:
+- Use the supplied context as your sole source of factual information.
+- Do not introduce outside knowledge, assumptions, or unsupported details.
+- If the context does not contain enough information to answer the question, respond exactly with:
+  "I could not find the answer in the provided document."
+- Present the answer in clear, concise, and easy-to-understand language.
+- For technical topics, explain concepts accurately and include relevant details only when supported by the context.
+- Do not mention internal retrieval processes or invent information to fill gaps.
+
+Your priority is to provide a reliable answer that is fully supported by the available documents.
+`,
+    },
+  });</pre>
+<div class="note">To use this for another topic, change "Node.js expert" to your subject, such as a DSA teacher or a Python tutor.</div>
+
+<h3>Step 9: Save the answer and print it</h3>
+<pre>  chatHistory.push({
+    role: 'model',
+    parts: [{ text: response.text }],
+  });
+
+  console.log('\n');
+  console.log(response.text);
+}</pre>
+
+<h3>Step 10: Keep the chat running in a loop</h3>
+<pre>async function main() {
+  const userQuestion = readlineSync.question('Ask me anything--&gt; ');
+  await askQuestion(userQuestion);
+  main();
+}
+
+main();</pre>
+
+<h2 id="run">Run Order</h2>
+<p>Run these commands in this order. Phases 1 and 2 are one-time. Phase 3 is the chatbot you use daily.</p>
+<pre>node createIndex.js
+node storeVectors.js
+node chat.js</pre>
+<div class="note">New PDF? Change <code class="i">PDF_FILE_PATH</code> and run <code class="i">node storeVectors.js</code> again. You do not need to create the index again.</div>
+</main>
+<footer>Notes created by Sourabh Tembhare, owner of the Sourabh Tembhare YouTube channel.</footer>
+<script>
+document.querySelectorAll('pre').forEach(function(pre){
+  var box=document.createElement('div');box.className='code';
+  pre.parentNode.insertBefore(box,pre);box.appendChild(pre);
+  var b=document.createElement('button');b.className='copy';b.textContent='Copy';
+  b.addEventListener('click',function(){
+    var t=pre.innerText;
+    var done=function(){b.textContent='Copied';b.classList.add('done');setTimeout(function(){b.textContent='Copy';b.classList.remove('done')},1600)};
+    if(navigator.clipboard&&window.isSecureContext){navigator.clipboard.writeText(t).then(done)}
+    else{var a=document.createElement('textarea');a.value=t;document.body.appendChild(a);a.select();document.execCommand('copy');a.remove();done()}
+  });
+  box.appendChild(b);
+});
+</script>
+</body>
+</html>
